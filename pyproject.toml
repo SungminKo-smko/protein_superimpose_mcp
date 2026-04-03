@@ -1,0 +1,21 @@
+[project]
+name = "protein-superimpose-mcp"
+version = "0.1.0"
+description = "MCP server for protein structure superimposition"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "biopython>=1.80",
+    "gemmi>=0.6.0",
+    "numpy>=1.24.0",
+]
+
+[project.scripts]
+protein-superimpose-mcp = "protein_superimpose_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/protein_superimpose_mcp"]
