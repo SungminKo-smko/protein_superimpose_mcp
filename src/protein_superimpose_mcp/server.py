@@ -15,10 +15,7 @@ from .core import (
     superimpose_all as _superimpose_all,
 )
 
-mcp = FastMCP(
-    "protein-superimpose",
-    description="단백질 구조 superimposition MCP 서버 - CIF 파일의 Cα 원자 기반 구조 정렬",
-)
+mcp = FastMCP("protein-superimpose")
 
 
 @mcp.tool()
