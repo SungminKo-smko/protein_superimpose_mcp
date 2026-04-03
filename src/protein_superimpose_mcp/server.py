@@ -123,8 +123,10 @@ def main():
     """MCP 서버 실행."""
     import sys
 
-    transport = "sse" if "--transport" in sys.argv and "sse" in sys.argv else "stdio"
-    mcp.run(transport=transport)
+    if "--transport" in sys.argv and "sse" in sys.argv:
+        mcp.run(transport="sse", host="0.0.0.0", port=8000)
+    else:
+        mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":
