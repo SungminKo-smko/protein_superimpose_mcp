@@ -15,7 +15,15 @@ from .core import (
     superimpose_all as _superimpose_all,
 )
 
-mcp = FastMCP("protein-superimpose")
+import os
+
+_is_container = os.environ.get("CONTAINER_APP_NAME") or os.environ.get("MCP_HOST")
+
+mcp = FastMCP(
+    "protein-superimpose",
+    host="0.0.0.0" if _is_container else "127.0.0.1",
+    port=8000,
+)
 
 
 @mcp.tool()
@@ -121,7 +129,7 @@ def main():
     import sys
 
     if "--transport" in sys.argv and "sse" in sys.argv:
-        mcp.run(transport="sse", host="0.0.0.0", port=8000)
+        mcp.run(transport="sse")
     else:
         mcp.run(transport="stdio")
 
