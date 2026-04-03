@@ -121,7 +121,10 @@ def list_cif_files(directory: str) -> dict:
 
 def main():
     """MCP 서버 실행."""
-    mcp.run()
+    import sys
+
+    transport = "sse" if "--transport" in sys.argv and "sse" in sys.argv else "stdio"
+    mcp.run(transport=transport)
 
 
 if __name__ == "__main__":
