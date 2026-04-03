@@ -8,6 +8,7 @@ dependencies = [
     "biopython>=1.80",
     "gemmi>=0.6.0",
     "numpy>=1.24.0",
+    "azure-storage-blob>=12.0.0",
 ]
 
 [project.scripts]

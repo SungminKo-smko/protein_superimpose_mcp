@@ -9,6 +9,7 @@ Azure Files를 통한 파일 업로드/다운로드를 지원.
 import os
 import base64
 import shutil
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -18,6 +19,11 @@ from .core import (
     superimpose_group as _superimpose_group,
     superimpose_all as _superimpose_all,
 )
+
+# Azure Blob Storage 설정
+AZURE_STORAGE_ACCOUNT = os.environ.get("AZURE_STORAGE_ACCOUNT", "nanomapstorage")
+AZURE_STORAGE_KEY = os.environ.get("AZURE_STORAGE_KEY", "")
+AZURE_BLOB_CONTAINER = os.environ.get("AZURE_BLOB_CONTAINER", "superimpose")
 
 _is_container = os.environ.get("CONTAINER_APP_NAME") or os.environ.get("MCP_HOST")
 
@@ -33,12 +39,180 @@ mcp = FastMCP(
 )
 
 
+def _generate_sas_url(blob_name: str, permissions: str = "rcw", expiry_hours: int = 1) -> str:
+    """Azure Blob에 대한 SAS URL 생성."""
+    from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
+
+    expiry = datetime.now(timezone.utc) + timedelta(hours=expiry_hours)
+    perms = BlobSasPermissions(
+        read="r" in permissions,
+        create="c" in permissions,
+        write="w" in permissions,
+        delete="d" in permissions,
+    )
+    sas_token = generate_blob_sas(
+        account_name=AZURE_STORAGE_ACCOUNT,
+        container_name=AZURE_BLOB_CONTAINER,
+        blob_name=blob_name,
+        account_key=AZURE_STORAGE_KEY,
+        permission=perms,
+        expiry=expiry,
+    )
+    return f"https://{AZURE_STORAGE_ACCOUNT}.blob.core.windows.net/{AZURE_BLOB_CONTAINER}/{blob_name}?{sas_token}"
+
+
+def _sync_blob_to_local(blob_name: str, local_path: Path):
+    """Azure Blob에서 로컬로 파일 다운로드."""
+    from azure.storage.blob import BlobServiceClient
+
+    client = BlobServiceClient(
+        account_url=f"https://{AZURE_STORAGE_ACCOUNT}.blob.core.windows.net",
+        credential=AZURE_STORAGE_KEY,
+    )
+    blob_client = client.get_blob_client(AZURE_BLOB_CONTAINER, blob_name)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(local_path, "wb") as f:
+        f.write(blob_client.download_blob().readall())
+
+
+def _upload_local_to_blob(local_path: Path, blob_name: str):
+    """로컬 파일을 Azure Blob에 업로드."""
+    from azure.storage.blob import BlobServiceClient
+
+    client = BlobServiceClient(
+        account_url=f"https://{AZURE_STORAGE_ACCOUNT}.blob.core.windows.net",
+        credential=AZURE_STORAGE_KEY,
+    )
+    blob_client = client.get_blob_client(AZURE_BLOB_CONTAINER, blob_name)
+    with open(local_path, "rb") as f:
+        blob_client.upload_blob(f, overwrite=True)
+
+
+@mcp.tool()
+def get_upload_urls(filenames: list[str], subfolder: str = "") -> dict:
+    """여러 CIF 파일을 직접 업로드할 수 있는 SAS URL을 생성합니다.
+
+    반환된 URL로 HTTP PUT 요청을 보내면 Azure Blob에 직접 업로드됩니다.
+    MCP 서버를 거치지 않으므로 대량 파일도 빠르게 업로드할 수 있습니다.
+
+    업로드 후 sync_uploaded_files를 호출하여 서버에 동기화하세요.
+
+    Args:
+        filenames: 업로드할 파일명 목록 (예: ["a.cif", "b.cif", "c.cif"])
+        subfolder: blob 내 하위 경로 (선택, 예: "batch1")
+    """
+    if not AZURE_STORAGE_KEY:
+        return {"status": "error", "error": "AZURE_STORAGE_KEY가 설정되지 않았습니다"}
+
+    urls = []
+    for fname in filenames:
+        blob_name = f"upload/{subfolder}/{fname}" if subfolder else f"upload/{fname}"
+        url = _generate_sas_url(blob_name, permissions="rcw")
+        urls.append({
+            "filename": fname,
+            "blob_name": blob_name,
+            "upload_url": url,
+            "method": "PUT",
+            "headers": {"x-ms-blob-type": "BlockBlob"},
+        })
+
+    return {
+        "status": "success",
+        "count": len(urls),
+        "subfolder": subfolder,
+        "urls": urls,
+        "instructions": "각 URL에 PUT 요청으로 파일을 업로드한 후 sync_uploaded_files를 호출하세요.",
+    }
+
+
+@mcp.tool()
+def sync_uploaded_files(subfolder: str = "") -> dict:
+    """Azure Blob에 업로드된 파일을 서버 로컬 디렉토리에 동기화합니다.
+
+    get_upload_urls로 Blob에 직접 업로드한 후 이 도구를 호출하면
+    서버가 파일을 로컬로 가져와 superimpose 작업에 사용할 수 있게 합니다.
+
+    Args:
+        subfolder: 동기화할 blob 하위 경로 (get_upload_urls에서 사용한 것과 동일)
+    """
+    if not AZURE_STORAGE_KEY:
+        return {"status": "error", "error": "AZURE_STORAGE_KEY가 설정되지 않았습니다"}
+
+    from azure.storage.blob import BlobServiceClient
+
+    client = BlobServiceClient(
+        account_url=f"https://{AZURE_STORAGE_ACCOUNT}.blob.core.windows.net",
+        credential=AZURE_STORAGE_KEY,
+    )
+    container_client = client.get_container_client(AZURE_BLOB_CONTAINER)
+
+    prefix = f"upload/{subfolder}/" if subfolder else "upload/"
+    synced = 0
+    errors = []
+
+    for blob in container_client.list_blobs(name_starts_with=prefix):
+        rel_path = blob.name[len("upload/"):]  # upload/ 접두사 제거
+        local_path = UPLOAD_DIR / rel_path
+        try:
+            _sync_blob_to_local(blob.name, local_path)
+            synced += 1
+        except Exception as e:
+            errors.append(f"{blob.name}: {e}")
+
+    return {
+        "status": "success",
+        "synced": synced,
+        "local_dir": str(UPLOAD_DIR / subfolder if subfolder else UPLOAD_DIR),
+        "errors": errors,
+    }
+
+
+@mcp.tool()
+def get_download_urls(directory: str = "output") -> dict:
+    """정렬 결과 파일을 직접 다운로드할 수 있는 SAS URL을 생성합니다.
+
+    먼저 서버의 output 디렉토리에 있는 결과 파일을 Azure Blob에 업로드한 후,
+    각 파일의 다운로드 URL을 반환합니다.
+
+    Args:
+        directory: 다운로드할 디렉토리 ("output" 또는 하위 경로)
+    """
+    if not AZURE_STORAGE_KEY:
+        return {"status": "error", "error": "AZURE_STORAGE_KEY가 설정되지 않았습니다"}
+
+    target = OUTPUT_DIR / directory.replace("output/", "").replace("output", "") if directory != "output" else OUTPUT_DIR
+    if not target.exists():
+        return {"status": "error", "error": f"디렉토리가 존재하지 않습니다: {target}"}
+
+    urls = []
+    for p in sorted(target.rglob("*.cif")):
+        rel = p.relative_to(OUTPUT_DIR)
+        blob_name = f"output/{rel}"
+        try:
+            _upload_local_to_blob(p, blob_name)
+            url = _generate_sas_url(blob_name, permissions="r", expiry_hours=24)
+            urls.append({
+                "filename": p.name,
+                "blob_name": blob_name,
+                "download_url": url,
+                "size_bytes": p.stat().st_size,
+            })
+        except Exception as e:
+            urls.append({"filename": p.name, "error": str(e)})
+
+    return {
+        "status": "success",
+        "count": len(urls),
+        "urls": urls,
+        "expiry": "24시간",
+    }
+
+
 @mcp.tool()
 def upload_file(filename: str, content_base64: str, subfolder: str = "") -> dict:
-    """CIF 파일을 서버에 업로드합니다.
+    """CIF 파일을 서버에 업로드합니다 (소량 파일용).
 
-    파일 내용을 base64로 인코딩하여 전송합니다.
-    업로드된 파일은 서버의 upload 디렉토리에 저장됩니다.
+    대량 업로드는 get_upload_urls를 사용하세요.
 
     Args:
         filename: 저장할 파일명 (예: structure.cif)
@@ -64,9 +238,9 @@ def upload_file(filename: str, content_base64: str, subfolder: str = "") -> dict
 
 @mcp.tool()
 def download_file(path: str) -> dict:
-    """서버의 파일을 base64로 인코딩하여 반환합니다.
+    """서버의 파일을 base64로 반환합니다 (소량 파일용).
 
-    주로 정렬 결과 파일을 다운로드할 때 사용합니다.
+    대량 다운로드는 get_download_urls를 사용하세요.
 
     Args:
         path: 다운로드할 파일의 서버 내 경로
